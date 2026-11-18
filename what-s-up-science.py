@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import requests
 import html
+import xml.etree.ElementTree as ET
 import plotly.express as px
 import plotly.graph_objects as go
 import pycountry
@@ -1085,6 +1086,116 @@ def search_europe_pmc(query, search_field, year_from, year_to, max_results):
     return normalize_api_records(records[:max_results], "Europe PMC")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_pubmed(query, search_field, year_from, year_to, max_results):
+    """Search PubMed through the official NCBI E-utilities API."""
+    field_map = {
+        "Tous les champs": "[All Fields]",
+        "Titre / résumé": "[Title/Abstract]",
+        "Auteur": "[Author]",
+        "Affiliation": "[Affiliation]",
+    }
+    safe_query = str(query).strip().replace('"', ' ')
+    term = f'"{safe_query}"{field_map[search_field]}'
+    if year_from or year_to:
+        start = f"{int(year_from)}" if year_from else "1800"
+        end = f"{int(year_to)}" if year_to else "2100"
+        term += f' AND ("{start}"[Date - Publication] : "{end}"[Date - Publication])'
+
+    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    common_params = {"db": "pubmed", "tool": "WhatsUpScience", "email": ""}
+    search_params = {**common_params, "term": term, "retmode": "json",
+                     "retmax": min(int(max_results), 10000), "sort": "relevance"}
+    search_response = requests.get(
+        base_url + "esearch.fcgi", params=search_params,
+        headers=API_HEADERS, timeout=45
+    )
+    search_response.raise_for_status()
+    ids = search_response.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return normalize_api_records([], "PubMed")
+
+    # Fetch in modest batches to keep requests reliable and within NCBI guidance.
+    records = []
+    for start in range(0, len(ids), 200):
+        fetch_params = {**common_params, "id": ",".join(ids[start:start + 200]),
+                        "retmode": "xml"}
+        fetch_response = requests.get(
+            base_url + "efetch.fcgi", params=fetch_params,
+            headers=API_HEADERS, timeout=60
+        )
+        fetch_response.raise_for_status()
+        root = ET.fromstring(fetch_response.content)
+        for article in root.findall(".//PubmedArticle"):
+            medline = article.find("MedlineCitation")
+            article_node = medline.find("Article") if medline is not None else None
+            if article_node is None:
+                continue
+
+            def node_text(node):
+                return " ".join(t.strip() for t in node.itertext() if t and t.strip()) if node is not None else ""
+
+            pmid = node_text(medline.find("PMID")) if medline is not None else ""
+            title = node_text(article_node.find("ArticleTitle"))
+            abstract_parts = [node_text(x) for x in article_node.findall(".//Abstract/AbstractText")]
+            abstract = " ".join(x for x in abstract_parts if x)
+            journal_node = article_node.find("Journal")
+            journal = node_text(journal_node.find("Title")) if journal_node is not None else ""
+            year = ""
+            pub_date = journal_node.find("JournalIssue/PubDate") if journal_node is not None else None
+            if pub_date is not None:
+                year = node_text(pub_date.find("Year")) or node_text(pub_date.find("MedlineDate"))[:4]
+            if not year:
+                year = node_text(article_node.find(".//PubDate/Year"))
+
+            authors, affiliations = [], []
+            for author in article_node.findall(".//AuthorList/Author"):
+                collective = node_text(author.find("CollectiveName"))
+                name = collective or " ".join(x for x in [
+                    node_text(author.find("ForeName")), node_text(author.find("LastName"))
+                ] if x)
+                if name:
+                    authors.append(name)
+                for aff in author.findall(".//AffiliationInfo/Affiliation"):
+                    value = node_text(aff)
+                    if value:
+                        affiliations.append(value)
+
+            doi = ""
+            for identifier in article_node.findall(".//ELocationID") + article_node.findall(".//ArticleId"):
+                if identifier.attrib.get("EIdType") == "doi" or identifier.attrib.get("IdType") == "doi":
+                    doi = node_text(identifier)
+                    break
+            keywords = [node_text(k) for k in article.findall(".//Keyword") if node_text(k)]
+            pub_types = [node_text(x) for x in article_node.findall(".//PublicationType") if node_text(x)]
+            language = node_text(article_node.find("Language"))
+            issn = node_text(journal_node.find("ISSN")) if journal_node is not None else ""
+            records.append({
+                "Title": title, "Year": year[:4], "Journal": journal or "Unknown journal",
+                "Cited by": 0, "DOI": doi, "Authors": "; ".join(dict.fromkeys(authors)),
+                "Author full names": "; ".join(dict.fromkeys(authors)), "Author(s) ID": "",
+                "Affiliations": "; ".join(dict.fromkeys(affiliations)),
+                "Authors with affiliations": "", "Abstract": abstract,
+                "Author Keywords": "; ".join(dict.fromkeys(keywords)), "Index Keywords": "",
+                "Publisher": "Unknown", "Document Type": "; ".join(pub_types) or "Unknown",
+                "Open Access": "", "EID": pmid,
+                "Link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+                "ISSN": issn, "Language": language, "Publication Stage": "",
+            })
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return normalize_api_records([], "PubMed")
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["Cited by"] = 0  # PubMed does not expose a consistent citation count in E-utilities.
+    df["DOI URL"] = df["DOI"].apply(lambda x: f"https://doi.org/{x}" if x else "")
+    df["Text for topics"] = df["Title"] + " " + df["Abstract"] + " " + df["Author Keywords"]
+    df["_dedup"] = df["DOI"].str.lower().where(
+        df["DOI"].ne(""), df["Title"].str.lower().str.replace(r"\W+", " ", regex=True)
+    )
+    return df.drop_duplicates("_dedup").drop(columns="_dedup").reset_index(drop=True)
+
+
 with st.sidebar:
     st.markdown("## 📚 Data source")
     data_mode = st.radio(
@@ -1096,8 +1207,8 @@ with st.sidebar:
     if data_mode == "Search open databases":
         api_source = st.selectbox(
             "Database",
-            ["HAL", "Europe PMC", "Crossref"],
-            help="HAL est un archive ouverte multidisciplinaire française ; Europe PMC cible les sciences du vivant ; Crossref couvre largement les publications."
+            ["PubMed", "HAL", "Europe PMC", "Crossref"],
+            help="PubMed et Europe PMC couvrent les sciences biomédicales ; HAL est une archive ouverte multidisciplinaire ; Crossref couvre largement les publications."
         )
         search_field = st.selectbox(
             "Search in",
@@ -1135,7 +1246,11 @@ if data_mode == "Search open databases":
             st.stop()
         try:
             with st.spinner(f"Searching {api_source}…"):
-                if api_source == "HAL":
+                if api_source == "PubMed":
+                    result_df = search_pubmed(
+                        search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
+                    )
+                elif api_source == "HAL":
                     result_df = search_hal(
                         search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
                     )
@@ -1169,6 +1284,8 @@ if data_mode == "Search open databases":
     st.success(f"{len(library):,} publications récupérées depuis {api_source}.")
     if api_source == "HAL":
         st.info("HAL recense les dépôts et notices présents dans l'archive ouverte. Les citations ne sont pas fournies de façon homogène par cette API : elles sont mises à zéro et les indices h/i10 ne sont donc pas interprétables pour ce jeu de données.")
+    elif api_source == "PubMed":
+        st.info("PubMed fournit les notices biomédicales, résumés, auteurs et affiliations. L'API E-utilities ne fournit pas de nombre de citations homogène : les citations sont mises à zéro et les indices h/i10 ne sont donc pas interprétables pour ce jeu de données.")
 else:
     if uploaded_file is None:
         st.info("Importe un fichier CSV Scopus pour construire ton tableau de bord bibliométrique.")
@@ -1221,6 +1338,116 @@ else:
 # ============================================================
 # 9. DYNAMIC FILTERS
 # ============================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_pubmed(query, search_field, year_from, year_to, max_results):
+    """Search PubMed through the official NCBI E-utilities API."""
+    field_map = {
+        "Tous les champs": "[All Fields]",
+        "Titre / résumé": "[Title/Abstract]",
+        "Auteur": "[Author]",
+        "Affiliation": "[Affiliation]",
+    }
+    safe_query = str(query).strip().replace('"', ' ')
+    term = f'"{safe_query}"{field_map[search_field]}'
+    if year_from or year_to:
+        start = f"{int(year_from)}" if year_from else "1800"
+        end = f"{int(year_to)}" if year_to else "2100"
+        term += f' AND ("{start}"[Date - Publication] : "{end}"[Date - Publication])'
+
+    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    common_params = {"db": "pubmed", "tool": "WhatsUpScience", "email": ""}
+    search_params = {**common_params, "term": term, "retmode": "json",
+                     "retmax": min(int(max_results), 10000), "sort": "relevance"}
+    search_response = requests.get(
+        base_url + "esearch.fcgi", params=search_params,
+        headers=API_HEADERS, timeout=45
+    )
+    search_response.raise_for_status()
+    ids = search_response.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return normalize_api_records([], "PubMed")
+
+    # Fetch in modest batches to keep requests reliable and within NCBI guidance.
+    records = []
+    for start in range(0, len(ids), 200):
+        fetch_params = {**common_params, "id": ",".join(ids[start:start + 200]),
+                        "retmode": "xml"}
+        fetch_response = requests.get(
+            base_url + "efetch.fcgi", params=fetch_params,
+            headers=API_HEADERS, timeout=60
+        )
+        fetch_response.raise_for_status()
+        root = ET.fromstring(fetch_response.content)
+        for article in root.findall(".//PubmedArticle"):
+            medline = article.find("MedlineCitation")
+            article_node = medline.find("Article") if medline is not None else None
+            if article_node is None:
+                continue
+
+            def node_text(node):
+                return " ".join(t.strip() for t in node.itertext() if t and t.strip()) if node is not None else ""
+
+            pmid = node_text(medline.find("PMID")) if medline is not None else ""
+            title = node_text(article_node.find("ArticleTitle"))
+            abstract_parts = [node_text(x) for x in article_node.findall(".//Abstract/AbstractText")]
+            abstract = " ".join(x for x in abstract_parts if x)
+            journal_node = article_node.find("Journal")
+            journal = node_text(journal_node.find("Title")) if journal_node is not None else ""
+            year = ""
+            pub_date = journal_node.find("JournalIssue/PubDate") if journal_node is not None else None
+            if pub_date is not None:
+                year = node_text(pub_date.find("Year")) or node_text(pub_date.find("MedlineDate"))[:4]
+            if not year:
+                year = node_text(article_node.find(".//PubDate/Year"))
+
+            authors, affiliations = [], []
+            for author in article_node.findall(".//AuthorList/Author"):
+                collective = node_text(author.find("CollectiveName"))
+                name = collective or " ".join(x for x in [
+                    node_text(author.find("ForeName")), node_text(author.find("LastName"))
+                ] if x)
+                if name:
+                    authors.append(name)
+                for aff in author.findall(".//AffiliationInfo/Affiliation"):
+                    value = node_text(aff)
+                    if value:
+                        affiliations.append(value)
+
+            doi = ""
+            for identifier in article_node.findall(".//ELocationID") + article_node.findall(".//ArticleId"):
+                if identifier.attrib.get("EIdType") == "doi" or identifier.attrib.get("IdType") == "doi":
+                    doi = node_text(identifier)
+                    break
+            keywords = [node_text(k) for k in article.findall(".//Keyword") if node_text(k)]
+            pub_types = [node_text(x) for x in article_node.findall(".//PublicationType") if node_text(x)]
+            language = node_text(article_node.find("Language"))
+            issn = node_text(journal_node.find("ISSN")) if journal_node is not None else ""
+            records.append({
+                "Title": title, "Year": year[:4], "Journal": journal or "Unknown journal",
+                "Cited by": 0, "DOI": doi, "Authors": "; ".join(dict.fromkeys(authors)),
+                "Author full names": "; ".join(dict.fromkeys(authors)), "Author(s) ID": "",
+                "Affiliations": "; ".join(dict.fromkeys(affiliations)),
+                "Authors with affiliations": "", "Abstract": abstract,
+                "Author Keywords": "; ".join(dict.fromkeys(keywords)), "Index Keywords": "",
+                "Publisher": "Unknown", "Document Type": "; ".join(pub_types) or "Unknown",
+                "Open Access": "", "EID": pmid,
+                "Link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+                "ISSN": issn, "Language": language, "Publication Stage": "",
+            })
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return normalize_api_records([], "PubMed")
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["Cited by"] = 0  # PubMed does not expose a consistent citation count in E-utilities.
+    df["DOI URL"] = df["DOI"].apply(lambda x: f"https://doi.org/{x}" if x else "")
+    df["Text for topics"] = df["Title"] + " " + df["Abstract"] + " " + df["Author Keywords"]
+    df["_dedup"] = df["DOI"].str.lower().where(
+        df["DOI"].ne(""), df["Title"].str.lower().str.replace(r"\W+", " ", regex=True)
+    )
+    return df.drop_duplicates("_dedup").drop(columns="_dedup").reset_index(drop=True)
+
 
 with st.sidebar:
 
