@@ -947,6 +947,114 @@ def search_crossref(query, search_field, year_from, year_to, max_results):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def search_hal(query, search_field, year_from, year_to, max_results):
+    """Search HAL's public Solr API and normalize records for the dashboard."""
+    field_map = {
+        "Tous les champs": "text",
+        "Titre / résumé": "(title_t OR abstract_t)",
+        "Auteur": "auth_t",
+        "Affiliation": "(labStructName_t OR instStructName_t)",
+    }
+    # HAL uses Solr syntax. Quoted phrase keeps multi-word searches together.
+    safe_query = str(query).replace('\\', ' ').replace('"', ' ').strip()
+    solr_query = f'{field_map[search_field]}:"{safe_query}"'
+    params = {
+        "q": solr_query,
+        "wt": "json",
+        "rows": min(int(max_results), 1000),
+        "fl": ",".join([
+            "docid", "halId_s", "uri_s", "title_s", "producedDateY_i", "journalTitle_s",
+            "authFullName_s", "labStructName_s", "labStructCountry_s",
+            "instStructName_s", "instStructCountry_s", "abstract_s",
+            "keyword_s", "doiId_s", "docType_s", "publisher_s",
+            "language_s", "openAccess_bool"
+        ]),
+        "sort": "producedDateY_i desc",
+    }
+    if year_from and year_to:
+        params["fq"] = f"producedDateY_i:[{int(year_from)} TO {int(year_to)}]"
+
+    response = requests.get(
+        "https://api.archives-ouvertes.fr/search/",
+        params=params, headers=API_HEADERS, timeout=60
+    )
+    response.raise_for_status()
+    payload = response.json()
+    records = payload.get("response", {}).get("docs", [])
+
+    rows = []
+    for item in records:
+        def values(field):
+            value = item.get(field, [])
+            if value is None:
+                return []
+            return value if isinstance(value, list) else [value]
+
+        title_values = values("title_s")
+        title = str(title_values[0]) if title_values else ""
+        authors = "; ".join(str(x) for x in values("authFullName_s") if x)
+        affiliation_values = (
+            values("labStructName_s") + values("instStructName_s")
+        )
+        affiliations = "; ".join(dict.fromkeys(str(x) for x in affiliation_values if x))
+        countries = values("labStructCountry_s") + values("instStructCountry_s")
+        if countries:
+            affiliations += ("; " if affiliations else "") + "; ".join(str(x) for x in countries)
+        journal_values = values("journalTitle_s")
+        doi_values = values("doiId_s")
+        docid = item.get("halId_s") or item.get("docid", "")
+        uri_values = values("uri_s")
+        link = str(uri_values[0]) if uri_values else (f"https://hal.science/{docid}" if docid else "")
+        year_values = values("producedDateY_i")
+        abstract = " ".join(str(x) for x in values("abstract_s"))
+        keywords = "; ".join(str(x) for x in values("keyword_s") if x)
+        type_values = values("docType_s")
+        publisher_values = values("publisher_s")
+        language_values = values("language_s")
+        open_access_values = values("openAccess_bool")
+        rows.append({
+            "Title": title,
+            "Year": year_values[0] if year_values else None,
+            "Journal": str(journal_values[0]) if journal_values else "Unknown journal",
+            # HAL does not provide a consistent citation count in this search API.
+            "Cited by": 0,
+            "DOI": str(doi_values[0]) if doi_values else "",
+            "Authors": authors,
+            "Author full names": authors,
+            "Author(s) ID": "",
+            "Affiliations": affiliations,
+            "Authors with affiliations": "",
+            "Abstract": clean_abstract(abstract),
+            "Author Keywords": keywords,
+            "Index Keywords": "",
+            "Publisher": str(publisher_values[0]) if publisher_values else "Unknown",
+            "Document Type": str(type_values[0]) if type_values else "Unknown",
+            "Open Access": str(open_access_values[0]) if open_access_values else "",
+            "EID": str(docid),
+            "Link": link,
+            "ISSN": "",
+            "Language": str(language_values[0]) if language_values else "",
+            "Publication Stage": "",
+        })
+
+    normalized = pd.DataFrame(rows)
+    if normalized.empty:
+        return normalize_api_records([], "HAL")
+    normalized["Year"] = pd.to_numeric(normalized["Year"], errors="coerce")
+    normalized["Cited by"] = 0
+    normalized["DOI URL"] = normalized["DOI"].apply(
+        lambda x: f"https://doi.org/{x}" if x else ""
+    )
+    normalized["Text for topics"] = (
+        normalized["Title"] + " " + normalized["Abstract"] + " " + normalized["Author Keywords"]
+    )
+    normalized["_dedup"] = normalized["DOI"].str.lower().where(
+        normalized["DOI"].ne(""), normalized["Title"].str.lower().str.replace(r"\W+", " ", regex=True)
+    )
+    return normalized.drop_duplicates("_dedup").drop(columns="_dedup").reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def search_europe_pmc(query, search_field, year_from, year_to, max_results):
     field_map = {
         "Tous les champs": "(TITLE_ABS:{q} OR AUTH:{q} OR AFFILIATION:{q})",
@@ -988,8 +1096,8 @@ with st.sidebar:
     if data_mode == "Search open databases":
         api_source = st.selectbox(
             "Database",
-            ["Europe PMC", "Crossref"],
-            help="Europe PMC is particularly suitable for life sciences; Crossref has broader disciplinary coverage."
+            ["HAL", "Europe PMC", "Crossref"],
+            help="HAL est un archive ouverte multidisciplinaire française ; Europe PMC cible les sciences du vivant ; Crossref couvre largement les publications."
         )
         search_field = st.selectbox(
             "Search in",
@@ -1027,7 +1135,11 @@ if data_mode == "Search open databases":
             st.stop()
         try:
             with st.spinner(f"Searching {api_source}…"):
-                if api_source == "Europe PMC":
+                if api_source == "HAL":
+                    result_df = search_hal(
+                        search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
+                    )
+                elif api_source == "Europe PMC":
                     result_df = search_europe_pmc(
                         search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
                     )
@@ -1055,6 +1167,8 @@ if data_mode == "Search open databases":
         st.stop()
     original_columns = library.columns.tolist()
     st.success(f"{len(library):,} publications récupérées depuis {api_source}.")
+    if api_source == "HAL":
+        st.info("HAL recense les dépôts et notices présents dans l'archive ouverte. Les citations ne sont pas fournies de façon homogène par cette API : elles sont mises à zéro et les indices h/i10 ne sont donc pas interprétables pour ce jeu de données.")
 else:
     if uploaded_file is None:
         st.info("Importe un fichier CSV Scopus pour construire ton tableau de bord bibliométrique.")
