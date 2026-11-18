@@ -208,7 +208,7 @@ st.markdown("""
 
 
 # ============================================================
-# 3. DATA IMPORT AND SCOPUS NORMALIZATION
+# 3. PUBLICATION DATA NORMALIZATION
 # ============================================================
 
 @st.cache_data(show_spinner=False)
@@ -773,7 +773,7 @@ def show_chart(fig, key=None):
 
 
 # ============================================================
-# 8. DATA SOURCES: PUBLIC APIs OR SCOPUS CSV
+# 8. HAL DATA SOURCE
 # ============================================================
 
 API_HEADERS = {
@@ -1248,106 +1248,64 @@ def search_pubmed(query, search_field, year_from, year_to, max_results):
 
 
 with st.sidebar:
-    st.markdown("## 📚 Data source")
-    data_mode = st.radio(
-        "Choose how to load publications",
-        ["Search open databases", "Upload Scopus CSV"],
-        index=0
+    st.markdown("## 📚 Base de données")
+    st.markdown("**HAL – Archive ouverte**")
+    st.caption("Recherche directe dans HAL · API publique · Sans clé API")
+    search_field = st.selectbox(
+        "Rechercher dans",
+        ["Tous les champs", "Titre / résumé", "Auteur", "Affiliation"]
     )
-
-    if data_mode == "Search open databases":
-        api_source = st.selectbox(
-            "Database",
-            ["PubMed", "HAL", "Europe PMC", "Crossref"],
-            help="PubMed et Europe PMC couvrent les sciences biomédicales ; HAL est une archive ouverte multidisciplinaire ; Crossref couvre largement les publications."
-        )
-        search_field = st.selectbox(
-            "Search in",
-            ["Tous les champs", "Titre / résumé", "Auteur", "Affiliation"]
-        )
-        search_query = st.text_input(
-            "Search terms",
-            placeholder="e.g. phenolic acid decarboxylase"
-        )
-        year_col1, year_col2 = st.columns(2)
-        with year_col1:
-            year_from = st.number_input("From", min_value=1900, max_value=2100, value=2010, step=1)
-        with year_col2:
-            year_to = st.number_input("To", min_value=1900, max_value=2100, value=2026, step=1)
-        max_results = st.select_slider(
-            "Maximum records", options=[50, 100, 250, 500, 1000], value=250
-        )
-        run_search = st.button("🔎 Search publications", type="primary", use_container_width=True)
-        st.caption("Public APIs · No API key required · Results cached for one hour")
-        uploaded_file = None
-    else:
-        uploaded_file = st.file_uploader("Import Scopus CSV", type=["csv"])
+    search_query = st.text_input(
+        "Termes de recherche",
+        placeholder="Ex. phenolic acid decarboxylase"
+    )
+    year_col1, year_col2 = st.columns(2)
+    with year_col1:
+        year_from = st.number_input("Depuis", min_value=1900, max_value=2100, value=2010, step=1)
+    with year_col2:
+        year_to = st.number_input("Jusqu'à", min_value=1900, max_value=2100, value=2026, step=1)
+    max_results = st.select_slider(
+        "Nombre maximal de résultats", options=[50, 100, 250, 500, 1000], value=250
+    )
+    run_search = st.button("🔎 Rechercher dans HAL", type="primary", use_container_width=True)
 
 
-if data_mode == "Search open databases":
-    if not search_query.strip():
-        st.info("Saisis un auteur, une affiliation ou des mots-clés dans la barre latérale, puis lance la recherche.")
-        st.stop()
-    if not run_search and "api_search_df" not in st.session_state:
-        st.info("Clique sur **Search publications** pour interroger la base sélectionnée.")
-        st.stop()
-    if run_search:
-        if year_from > year_to:
-            st.error("L'année de début doit être antérieure ou égale à l'année de fin.")
-            st.stop()
-        try:
-            with st.spinner(f"Searching {api_source}…"):
-                if api_source == "PubMed":
-                    result_df = search_pubmed(
-                        search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
-                    )
-                elif api_source == "HAL":
-                    result_df = search_hal(
-                        search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
-                    )
-                elif api_source == "Europe PMC":
-                    result_df = search_europe_pmc(
-                        search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
-                    )
-                else:
-                    result_df = search_crossref(
-                        search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
-                    )
-            st.session_state["api_search_df"] = result_df
-            st.session_state["api_search_signature"] = (api_source, search_query, search_field, int(year_from), int(year_to), int(max_results))
-        except requests.RequestException as error:
-            st.error(f"API connection error: {error}")
-            st.stop()
-        except Exception as error:
-            st.error(f"Search error: {error}")
-            st.stop()
-
-    library = st.session_state.get("api_search_df", pd.DataFrame()).copy()
-    signature = st.session_state.get("api_search_signature")
-    current_signature = (api_source, search_query, search_field, int(year_from), int(year_to), int(max_results))
-    if signature != current_signature:
-        st.warning("Les paramètres ont changé. Clique sur **Search publications** pour actualiser les résultats.")
-        st.stop()
-    if library.empty:
-        st.warning("Aucune publication trouvée. Essaie d'autres termes ou une autre base.")
-        st.stop()
-    original_columns = library.columns.tolist()
-    st.success(f"{len(library):,} publications récupérées depuis {api_source}.")
-    if api_source == "HAL":
-        st.info("HAL recense les dépôts et notices présents dans l'archive ouverte. Les citations ne sont pas fournies de façon homogène par cette API : elles sont mises à zéro et les indices h/i10 ne sont donc pas interprétables pour ce jeu de données.")
-    elif api_source == "PubMed":
-        st.info("PubMed fournit les notices biomédicales, résumés, auteurs et affiliations. L'API E-utilities ne fournit pas de nombre de citations homogène : les citations sont mises à zéro et les indices h/i10 ne sont donc pas interprétables pour ce jeu de données.")
-else:
-    if uploaded_file is None:
-        st.info("Importe un fichier CSV Scopus pour construire ton tableau de bord bibliométrique.")
-        st.markdown("**Champs pris en charge :** titres, auteurs, affiliations, résumés, mots-clés, citations, DOI, revues et types de documents.")
+if not search_query.strip():
+    st.info("Saisis un auteur, une affiliation ou des mots-clés dans la barre latérale, puis lance la recherche dans HAL.")
+    st.stop()
+if not run_search and "api_search_df" not in st.session_state:
+    st.info("Clique sur **Rechercher dans HAL** pour interroger la base de données.")
+    st.stop()
+if run_search:
+    if year_from > year_to:
+        st.error("L'année de début doit être antérieure ou égale à l'année de fin.")
         st.stop()
     try:
-        library, original_columns = prepare_data(uploaded_file.getvalue())
+        with st.spinner("Recherche des publications dans HAL…"):
+            result_df = search_hal(
+                search_query.strip(), search_field, int(year_from), int(year_to), int(max_results)
+            )
+        st.session_state["api_search_df"] = result_df
+        st.session_state["api_search_signature"] = (search_query, search_field, int(year_from), int(year_to), int(max_results))
+    except requests.RequestException as error:
+        st.error(f"Erreur de connexion à HAL : {error}")
+        st.stop()
     except Exception as error:
-        st.error(f"CSV import error: {error}")
+        st.error(f"Erreur lors de la recherche : {error}")
         st.stop()
 
+library = st.session_state.get("api_search_df", pd.DataFrame()).copy()
+signature = st.session_state.get("api_search_signature")
+current_signature = (search_query, search_field, int(year_from), int(year_to), int(max_results))
+if signature != current_signature:
+    st.warning("Les paramètres ont changé. Clique sur **Rechercher dans HAL** pour actualiser les résultats.")
+    st.stop()
+if library.empty:
+    st.warning("Aucune publication trouvée dans HAL. Essaie d'autres termes ou élargis la période.")
+    st.stop()
+original_columns = library.columns.tolist()
+st.success(f"{len(library):,} publications récupérées depuis HAL.")
+st.info("HAL recense les dépôts et notices présents dans l'archive ouverte. Les citations ne sont pas fournies de façon homogène par cette API : elles sont mises à zéro et les indices h/i10 ne sont donc pas interprétables pour ce jeu de données.")
 
 # Journal database enrichment
 journal_db = load_journal_database()
@@ -1657,11 +1615,10 @@ for value in filtered["Authors"]:
 # 11. DASHBOARD TABS
 # ============================================================
 
-overview, topics, collaborations, impact, records = st.tabs([
+overview, topics, collaborations, records = st.tabs([
     "📊 Overview",
     "🧬 Research themes",
     "🌍 Collaborations",
-    "📚 Sources & impact",
     "🗂️ Publications"
 ])
 
@@ -1741,7 +1698,7 @@ with overview:
 
         section(
             "Document types",
-            "Distribution of Scopus document categories."
+            "Distribution of document categories in HAL."
         )
 
         type_data = (
@@ -1833,7 +1790,7 @@ with topics:
 
     section(
         "Research themes",
-        "Explore scientific topics using abstracts and Scopus keywords."
+        "Explore scientific topics using HAL abstracts and keywords."
     )
 
     author_keywords = keyword_counter(
@@ -2565,178 +2522,6 @@ with collaborations:
 
 
 # ============================================================
-# TAB 4 — SOURCES AND IMPACT
-# ============================================================
-
-with impact:
-
-    section(
-        "Sources & impact",
-        "Journal distribution, publishers and citation impact."
-    )
-
-    left, right = st.columns(2)
-
-    with left:
-
-        section("Publishers")
-
-        publisher_data = (
-            filtered["Publisher"]
-            .replace("", "Unknown")
-            .value_counts()
-            .head(12)
-            .reset_index()
-        )
-
-        publisher_data.columns = [
-            "Publisher", "Publications"
-        ]
-
-        show_chart(
-            horizontal_bar(
-                publisher_data,
-                "Publisher",
-                "Publications",
-                420
-            ),
-            "impact_publishers"
-        )
-
-    with right:
-
-        section(
-            "Citation indicators",
-            "Bibliometric indicators calculated from the publications currently selected."
-        )
-
-        indicator_cols = st.columns(3)
-
-        with indicator_cols[0]:
-            kpi(
-                "Total citations",
-                f"{total_citations:,}",
-                "Sum of citations"
-            )
-
-        with indicator_cols[1]:
-            kpi(
-                "h-index",
-                f"{h_index:,}",
-                "Publications cited at least h times"
-            )
-
-        with indicator_cols[2]:
-            kpi(
-                "i10-index",
-                f"{i10_index:,}",
-                "Publications with ≥ 10 citations"
-            )
-
-    st.divider()
-
-    left, right = st.columns(2)
-
-    with left:
-
-        section("Citation distribution")
-
-        citation_data = filtered.copy()
-
-        citation_data["Citation group"] = pd.cut(
-            citation_data["Cited by"],
-            bins=[-1, 0, 5, 10, 25, 50, np.inf],
-            labels=[
-                "0", "1–5", "6–10",
-                "11–25", "26–50", ">50"
-            ]
-        )
-
-        citation_groups = (
-            citation_data["Citation group"]
-            .value_counts(sort=False)
-            .reset_index()
-        )
-
-        citation_groups.columns = [
-            "Citations", "Publications"
-        ]
-
-        fig = px.bar(
-            citation_groups,
-            x="Citations",
-            y="Publications",
-            text="Publications",
-            color_discrete_sequence=["#00A6A6"]
-        )
-
-        fig.update_traces(
-            textposition="outside"
-        )
-
-        show_chart(
-            chart_layout(fig, 360, False),
-            "impact_citations"
-        )
-
-    with right:
-
-        section("Most cited publications")
-
-        top = (
-            filtered
-            .sort_values("Cited by", ascending=False)
-            .head(8)
-            .copy()
-        )
-
-        top["Short title"] = (
-            top["Title"].str.slice(0, 55)
-        )
-
-        show_chart(
-            horizontal_bar(
-                top,
-                "Short title",
-                "Cited by",
-                360
-            ),
-            "impact_top_papers"
-        )
-
-    st.divider()
-
-    section("Journal and publisher summary")
-
-    journal_summary = (
-        filtered.groupby(
-            ["Journal", "Publisher"],
-            dropna=False
-        )
-        .agg(
-            Publications=("Title", "size"),
-            Citations=("Cited by", "sum"),
-            Mean_citations=("Cited by", "mean")
-        )
-        .reset_index()
-        .sort_values(
-            ["Publications", "Citations"],
-            ascending=False
-        )
-    )
-
-    journal_summary["Mean_citations"] = (
-        journal_summary["Mean_citations"].round(1)
-    )
-
-    st.dataframe(
-        journal_summary,
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ============================================================
 # TAB 5 — PUBLICATIONS AND EXPORT
 # ============================================================
 
@@ -2744,7 +2529,7 @@ with records:
 
     section(
         "Publication records",
-        "Search and inspect your filtered Scopus publications."
+        "Search and inspect your filtered HAL publications."
     )
 
     search = st.text_input(
@@ -2835,7 +2620,7 @@ with records:
     )
 
     st.caption(
-        f"{len(original_columns)} original Scopus columns detected."
+        f"{len(original_columns)} HAL fields processed."
     )
 
 
@@ -2846,5 +2631,5 @@ with records:
 st.divider()
 
 st.caption(
-    "What's up Science? · Scopus bibliometric dashboard"
+    "What's up Science? · HAL bibliometric dashboard"
 )
