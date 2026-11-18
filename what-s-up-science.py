@@ -966,7 +966,7 @@ def search_hal(query, search_field, year_from, year_to, max_results):
         "labStructName_s", "labStructAcronym_s", "labStructCountry_s",
         "instStructName_s", "instStructAcronym_s", "instStructCountry_s",
         "structName_s", "structAcronym_s", "structCountry_s",
-        "affiliation_s", "country_s", "abstract_s", "keyword_s",
+        "affiliation_s", "abstract_s", "keyword_s",
         "doiId_s", "docType_s", "publisher_s", "language_s", "openAccess_bool",
     ]
     params = {
@@ -1001,23 +1001,31 @@ def search_hal(query, search_field, year_from, year_to, max_results):
                 result.append(value)
         return result
 
-    def country_label(value):
-        """Convert HAL ISO country codes to readable country names."""
+    def country_iso3(value):
+        """Return a validated ISO-3 code from a structured HAL country value.
+
+        Deliberately accepts only HAL structure-country fields; generic
+        document country metadata and free-text affiliation parsing are not
+        used to build the international collaboration map.
+        """
         raw = str(value).strip()
         if not raw:
-            return ""
+            return None
         try:
             if len(raw) == 2:
                 country = pycountry.countries.get(alpha_2=raw.upper())
-                if country:
-                    return country.name
             elif len(raw) == 3:
                 country = pycountry.countries.get(alpha_3=raw.upper())
-                if country:
-                    return country.name
+            else:
+                country = pycountry.countries.lookup(raw)
+            return country.alpha_3 if country else None
         except (LookupError, AttributeError):
-            pass
-        return raw
+            return None
+
+    def country_label(value):
+        """Convert a validated ISO-3 country code to a readable name."""
+        country = pycountry.countries.get(alpha_3=value)
+        return country.name if country else str(value)
 
     rows = []
     for item in records:
@@ -1043,10 +1051,17 @@ def search_hal(query, search_field, year_from, year_to, max_results):
             if acronym not in affiliations and not any(acronym in name for name in affiliations):
                 affiliations.append(acronym)
 
+        # IMPORTANT: only countries explicitly attached to HAL research
+        # structures are eligible for collaboration statistics. Do not use
+        # country_s (generic document metadata) or infer countries from free
+        # text: either can create false international links (e.g. Japan).
         country_values = values(
-            "labStructCountry_s", "instStructCountry_s", "structCountry_s", "country_s"
+            "labStructCountry_s", "instStructCountry_s", "structCountry_s"
         )
-        countries = unique_text(country_label(x) for x in country_values)
+        country_codes = unique_text(
+            code for code in (country_iso3(x) for x in country_values) if code
+        )
+        countries = [country_label(code) for code in country_codes]
         affiliation_text = "; ".join(affiliations)
         if countries:
             affiliation_text += ("; " if affiliation_text else "") + "; ".join(countries)
@@ -1094,6 +1109,9 @@ def search_hal(query, search_field, year_from, year_to, max_results):
             "Author full names": authors,
             "Author(s) ID": "",
             "Affiliations": affiliation_text,
+            # Private analysis field: trusted ISO-3 countries from HAL's
+            # structured lab/institution fields only.
+            "_HAL_Country_ISO3": ";".join(country_codes),
             # Do not infer author-level links from document-level structures.
             "Authors with affiliations": "",
             "Abstract": clean_abstract(abstract),
@@ -2045,10 +2063,19 @@ with collaborations:
 
     for index, affiliation in filtered["Affiliations"].items():
 
-        found = extract_countries(affiliation)
+        # HAL uses only validated country codes derived from its structured
+        # laboratory/institution fields. Other sources retain text extraction.
+        if "_HAL_Country_ISO3" in filtered.columns:
+            raw_codes = filtered.at[index, "_HAL_Country_ISO3"]
+            found = {
+                code.strip().upper()
+                for code in str(raw_codes or "").split(";")
+                if code.strip() and pycountry.countries.get(alpha_3=code.strip().upper())
+            }
+        else:
+            found = extract_countries(affiliation)
 
         country_counts.update(found)
-
         paper_countries.append((index, found))
 
     if country_counts:
@@ -2634,7 +2661,7 @@ with records:
 
     export_columns = [
         col for col in filtered.columns
-        if col != "Text for topics"
+        if col not in {"Text for topics", "_HAL_Country_ISO3"}
     ]
 
     csv_data = filtered[
