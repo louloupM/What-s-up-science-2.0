@@ -1052,6 +1052,25 @@ def search_hal(query, search_field, year_from, year_to, max_results):
             affiliation_text += ("; " if affiliation_text else "") + "; ".join(countries)
 
         journal_values = values("journalTitle_s")
+        # HAL may place conference contributions (posters, oral communications,
+        # proceedings, etc.) in journalTitle_s. Keep these in a separate field
+        # rather than treating them as scientific journals.
+        venue_value = journal_values[0] if journal_values else ""
+        doc_type_value = "; ".join(values("docType_s"))
+        venue_lower = venue_value.casefold().strip()
+        doc_type_upper = doc_type_value.upper()
+        conference_type = bool(re.search(
+            r"\b(COMM|COMMUNICATIONS?|POSTERS?|CONFERENCES?|CONGRES|CONGRÈS)\b",
+            doc_type_upper
+        ))
+        conference_venue = bool(re.search(
+            r"^(poster\s+(dans|at|presented)|communication(s)?\s+(dans|à|a|at|in)|"
+            r"présentation(s)?\s+(dans|à|a|au|aux)|presentation(s)?\s+(at|in)|"
+            r"actes\s+(de|du|des)|proceedings\s+(of|from)|conference\s+(paper|abstract))\b",
+            venue_lower
+        ))
+        conference_event = venue_value if (conference_type or conference_venue) else ""
+        journal_name = "Unknown journal" if conference_event else (venue_value or "Unknown journal")
         doi_values = values("doiId_s")
         docid = item.get("halId_s") or item.get("docid", "")
         uri_values = values("uri_s")
@@ -1067,7 +1086,8 @@ def search_hal(query, search_field, year_from, year_to, max_results):
         rows.append({
             "Title": title,
             "Year": year_values[0] if year_values else None,
-            "Journal": journal_values[0] if journal_values else "Unknown journal",
+            "Journal": journal_name,
+            "Conference / event": conference_event,
             "Cited by": 0,
             "DOI": doi_values[0] if doi_values else "",
             "Authors": authors,
@@ -1487,7 +1507,8 @@ with st.sidebar:
         ]
 
     journal_options = sorted(
-        filtered["Journal"].dropna().unique()
+        x for x in filtered["Journal"].dropna().unique()
+        if x and x != "Unknown journal"
     )
 
     selected_journals = st.multiselect(
@@ -1576,7 +1597,11 @@ h_index = int(
 # i10-index: number of publications with at least 10 citations.
 i10_index = int((citation_values >= 10).sum())
 
-total_journals = filtered["Journal"].nunique()
+total_journals = filtered.loc[
+    filtered["Journal"].notna()
+    & ~filtered["Journal"].isin(["", "Unknown journal"]),
+    "Journal"
+].nunique()
 
 authors = {
     author
@@ -1748,9 +1773,13 @@ with overview:
 
         section("Most represented journals")
 
+        journal_counts = filtered.loc[
+            filtered["Journal"].notna()
+            & ~filtered["Journal"].isin(["", "Unknown journal"]),
+            "Journal"
+        ]
         data = (
-            filtered["Journal"]
-            .value_counts()
+            journal_counts.value_counts()
             .head(10)
             .reset_index()
         )
@@ -2544,6 +2573,7 @@ with records:
             "Title",
             "Authors",
             "Journal",
+            "Conference / event",
             "Abstract",
             "Author Keywords",
             "Index Keywords"
@@ -2564,6 +2594,7 @@ with records:
         "Title",
         "Authors",
         "Journal",
+        "Conference / event",
         "Cited by",
         "Author Keywords",
         "DOI URL"
