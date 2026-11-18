@@ -485,11 +485,12 @@ def text_counter(frame, column):
 
 # Connectors are retained inside scientific expressions, but never at
 # their beginning or end (e.g. "production of bio-based chemicals").
-CONCEPT_CONNECTORS = {"of", "for", "in", "on", "with", "by", "from", "and", "to"}
+CONCEPT_CONNECTORS = {"of", "for", "in", "on", "with", "by", "from", "and", "to", "via", "using"}
 CONCEPT_GENERIC = {
     "new method", "new approach", "different method", "high performance",
     "experimental results", "present study", "current study", "research work",
-    "novel approach", "novel method", "potential application"
+    "novel approach", "novel method", "potential application", "different conditions",
+    "good results", "significant effect", "high level", "low cost"
 }
 
 
@@ -498,53 +499,79 @@ def _concept_tokens(text):
     return re.findall(r"[a-z][a-z0-9-]{1,}", text)
 
 
-def extract_scientific_concepts(frame, column="Abstract", min_documents=2):
-    """Extract recurring multi-word scientific concepts from abstracts.
+def _title_anchor_tokens(title):
+    """Return informative title terms used to anchor abstract concepts."""
+    return {
+        token for token in _concept_tokens(title)
+        if token not in STOPWORDS and token not in CONCEPT_CONNECTORS
+        and len(token) >= 3
+    }
 
-    This is a transparent phrase-mining approach rather than a bag of words:
-    it proposes 2–5 word expressions, retains useful grammatical connectors,
-    removes generic expressions and counts each concept once per abstract.
+
+def extract_scientific_concepts(
+    frame, column="Abstract", title_column="Title", min_documents=2
+):
+    """Mine recurring abstract phrases that are demonstrably title-related.
+
+    Candidate concepts are multiword expressions from abstracts. A candidate
+    is retained for a publication only when at least one informative term is
+    also present in that publication's title. This title-anchor constraint
+    reduces generic abstract vocabulary and keeps the output focused on the
+    subject explicitly announced by each paper.
     """
     document_frequency = Counter()
-    total_documents = 0
 
-    for abstract in frame[column].fillna("").astype(str):
-        if not abstract.strip():
+    for _, row in frame.iterrows():
+        abstract = str(row.get(column, "") or "")
+        title = str(row.get(title_column, "") or "")
+        if not abstract.strip() or not title.strip():
             continue
-        total_documents += 1
-        tokens = _concept_tokens(abstract)
+
+        title_anchors = _title_anchor_tokens(title)
+        if not title_anchors:
+            continue
+
+        # Split into sentence-like units to avoid creating phrases across
+        # sentence boundaries, then mine 2–5 word scientific expressions.
         candidates = set()
+        for sentence in re.split(r"(?<=[.!?;:])\s+", abstract):
+            tokens = _concept_tokens(sentence)
+            for size in range(2, 6):
+                for start in range(0, len(tokens) - size + 1):
+                    phrase_tokens = tokens[start:start + size]
+                    if (phrase_tokens[0] in CONCEPT_CONNECTORS
+                            or phrase_tokens[-1] in CONCEPT_CONNECTORS):
+                        continue
+                    content_tokens = [
+                        token for token in phrase_tokens
+                        if token not in CONCEPT_CONNECTORS
+                    ]
+                    if len(content_tokens) < 2:
+                        continue
+                    if any(token in STOPWORDS for token in content_tokens):
+                        continue
+                    if sum(len(token) >= 3 for token in content_tokens) < 2:
+                        continue
 
-        for size in range(2, 6):
-            for start in range(0, len(tokens) - size + 1):
-                phrase_tokens = tokens[start:start + size]
-                if phrase_tokens[0] in CONCEPT_CONNECTORS or phrase_tokens[-1] in CONCEPT_CONNECTORS:
-                    continue
-                content_tokens = [t for t in phrase_tokens if t not in CONCEPT_CONNECTORS]
-                if len(content_tokens) < 2:
-                    continue
-                if any(t in STOPWORDS for t in content_tokens):
-                    continue
-                phrase = " ".join(phrase_tokens)
-                if phrase in CONCEPT_GENERIC:
-                    continue
-                # Avoid phrases made mostly of very short / non-descriptive tokens.
-                if sum(len(t) >= 3 for t in content_tokens) < 2:
-                    continue
-                candidates.add(phrase)
+                    # The key refinement: at least one meaningful concept
+                    # term must also occur in the corresponding publication title.
+                    if not (set(content_tokens) & title_anchors):
+                        continue
 
+                    phrase = " ".join(phrase_tokens)
+                    if phrase not in CONCEPT_GENERIC:
+                        candidates.add(phrase)
+
+        # A concept contributes at most once per publication.
         document_frequency.update(candidates)
 
-    # Keep recurring expressions only. Returning document frequency makes
-    # the chart interpretable as the number of publications mentioning a concept.
     recurring = {
         concept: freq for concept, freq in document_frequency.items()
         if freq >= min_documents
     }
 
-    # Collapse redundant fragments when a longer expression occurs in just
-    # as many or more abstracts (e.g. keep "lignocellulosic biomass conversion"
-    # instead of also listing its fragments as separate concepts).
+    # Prefer complete expressions over their shorter fragments when the
+    # longer expression occurs in at least as many publications.
     concepts = {}
     ordered = sorted(
         recurring.items(),
@@ -553,16 +580,17 @@ def extract_scientific_concepts(frame, column="Abstract", min_documents=2):
     )
     for concept, freq in ordered:
         tokens = concept.split()
-        is_redundant = any(
+        redundant = any(
             freq <= longer_freq
             and any(
-                tokens[i:i + len(tokens)] == tokens
-                for i in range(len(longer.split()) - len(tokens) + 1)
+                longer_tokens[i:i + len(tokens)] == tokens
+                for i in range(len(longer_tokens) - len(tokens) + 1)
             )
             for longer, longer_freq in concepts.items()
-            if len(longer.split()) > len(tokens)
+            for longer_tokens in [longer.split()]
+            if len(longer_tokens) > len(tokens)
         )
-        if not is_redundant:
+        if not redundant:
             concepts[concept] = freq
 
     return Counter(concepts)
@@ -1962,7 +1990,7 @@ with topics:
     )
 
     abstract_concepts = extract_scientific_concepts(
-        filtered, "Abstract", min_documents=2
+        filtered, column="Abstract", title_column="Title", min_documents=2
     )
 
     title_words = text_counter(
@@ -1993,6 +2021,11 @@ with topics:
         )
 
     st.write("")
+
+    st.caption(
+        "Scientific concepts are extracted from abstracts and retained only "
+        "when at least one meaningful term is also present in the corresponding title."
+    )
 
     theme_source = st.radio(
         "Thematic analysis source",
