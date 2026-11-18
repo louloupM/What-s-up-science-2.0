@@ -483,6 +483,91 @@ def text_counter(frame, column):
     return counts
 
 
+# Connectors are retained inside scientific expressions, but never at
+# their beginning or end (e.g. "production of bio-based chemicals").
+CONCEPT_CONNECTORS = {"of", "for", "in", "on", "with", "by", "from", "and", "to"}
+CONCEPT_GENERIC = {
+    "new method", "new approach", "different method", "high performance",
+    "experimental results", "present study", "current study", "research work",
+    "novel approach", "novel method", "potential application"
+}
+
+
+def _concept_tokens(text):
+    text = str(text).lower().replace("–", " ").replace("—", " ")
+    return re.findall(r"[a-z][a-z0-9-]{1,}", text)
+
+
+def extract_scientific_concepts(frame, column="Abstract", min_documents=2):
+    """Extract recurring multi-word scientific concepts from abstracts.
+
+    This is a transparent phrase-mining approach rather than a bag of words:
+    it proposes 2–5 word expressions, retains useful grammatical connectors,
+    removes generic expressions and counts each concept once per abstract.
+    """
+    document_frequency = Counter()
+    total_documents = 0
+
+    for abstract in frame[column].fillna("").astype(str):
+        if not abstract.strip():
+            continue
+        total_documents += 1
+        tokens = _concept_tokens(abstract)
+        candidates = set()
+
+        for size in range(2, 6):
+            for start in range(0, len(tokens) - size + 1):
+                phrase_tokens = tokens[start:start + size]
+                if phrase_tokens[0] in CONCEPT_CONNECTORS or phrase_tokens[-1] in CONCEPT_CONNECTORS:
+                    continue
+                content_tokens = [t for t in phrase_tokens if t not in CONCEPT_CONNECTORS]
+                if len(content_tokens) < 2:
+                    continue
+                if any(t in STOPWORDS for t in content_tokens):
+                    continue
+                phrase = " ".join(phrase_tokens)
+                if phrase in CONCEPT_GENERIC:
+                    continue
+                # Avoid phrases made mostly of very short / non-descriptive tokens.
+                if sum(len(t) >= 3 for t in content_tokens) < 2:
+                    continue
+                candidates.add(phrase)
+
+        document_frequency.update(candidates)
+
+    # Keep recurring expressions only. Returning document frequency makes
+    # the chart interpretable as the number of publications mentioning a concept.
+    recurring = {
+        concept: freq for concept, freq in document_frequency.items()
+        if freq >= min_documents
+    }
+
+    # Collapse redundant fragments when a longer expression occurs in just
+    # as many or more abstracts (e.g. keep "lignocellulosic biomass conversion"
+    # instead of also listing its fragments as separate concepts).
+    concepts = {}
+    ordered = sorted(
+        recurring.items(),
+        key=lambda item: (len(item[0].split()), item[1]),
+        reverse=True
+    )
+    for concept, freq in ordered:
+        tokens = concept.split()
+        is_redundant = any(
+            freq <= longer_freq
+            and any(
+                tokens[i:i + len(tokens)] == tokens
+                for i in range(len(longer.split()) - len(tokens) + 1)
+            )
+            for longer, longer_freq in concepts.items()
+            if len(longer.split()) > len(tokens)
+        )
+        if not is_redundant:
+            concepts[concept] = freq
+
+    return Counter(concepts)
+
+
 # ============================================================
 # 6. COUNTRY PROCESSING
 # ============================================================
@@ -1876,8 +1961,8 @@ with topics:
         filtered, "Index Keywords"
     )
 
-    abstract_words = text_counter(
-        filtered, "Abstract"
+    abstract_concepts = extract_scientific_concepts(
+        filtered, "Abstract", min_documents=2
     )
 
     title_words = text_counter(
@@ -1914,7 +1999,7 @@ with topics:
         [
             "Author keywords",
             "Indexed keywords",
-            "Abstract vocabulary",
+            "Scientific concepts (abstracts)",
             "Title vocabulary"
         ],
         horizontal=True
@@ -1923,7 +2008,7 @@ with topics:
     sources = {
         "Author keywords": author_keywords,
         "Indexed keywords": indexed_keywords,
-        "Abstract vocabulary": abstract_words,
+        "Scientific concepts (abstracts)": abstract_concepts,
         "Title vocabulary": title_words
     }
 
@@ -1941,20 +2026,26 @@ with topics:
 
         term_data = pd.DataFrame(
             counts.most_common(n_terms),
-            columns=["Term", "Frequency"]
+            columns=["Concept" if theme_source == "Scientific concepts (abstracts)" else "Term", "Publications"]
         )
+        display_label = "Concept" if theme_source == "Scientific concepts (abstracts)" else "Term"
+        frequency_label = "Publications"
 
         left, right = st.columns([1.2, 1])
 
         with left:
 
-            section("Most frequent terms")
+            section(
+                "Most frequent concepts"
+                if theme_source == "Scientific concepts (abstracts)"
+                else "Most frequent terms"
+            )
 
             show_chart(
                 horizontal_bar(
                     term_data,
-                    "Term",
-                    "Frequency",
+                    display_label,
+                    frequency_label,
                     max(420, n_terms * 24)
                 ),
                 "themes_terms"
@@ -1966,9 +2057,9 @@ with topics:
 
             fig = px.treemap(
                 term_data.head(15),
-                path=["Term"],
-                values="Frequency",
-                color="Frequency",
+                path=[display_label],
+                values=frequency_label,
+                color=frequency_label,
                 color_continuous_scale="Blues"
             )
 
