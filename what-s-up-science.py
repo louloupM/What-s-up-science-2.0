@@ -1343,7 +1343,6 @@ if library.empty:
     st.stop()
 original_columns = library.columns.tolist()
 st.success(f"{len(library):,} publications récupérées depuis HAL.")
-st.info("HAL recense les dépôts et notices présents dans l'archive ouverte. Les citations ne sont pas fournies de façon homogène par cette API : elles sont mises à zéro et les indices h/i10 ne sont donc pas interprétables pour ce jeu de données.")
 
 # Journal database enrichment
 journal_db = load_journal_database()
