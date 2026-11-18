@@ -789,19 +789,48 @@ def clean_abstract(value):
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
 
 
+def first_and_last_name(value, given=None, family=None):
+    """Keep only the first given name and the family name for display."""
+    if given or family:
+        given_parts = str(given or "").strip().split()
+        family_name = str(family or "").strip()
+        parts = ([given_parts[0]] if given_parts else [])
+        if family_name:
+            parts.append(family_name)
+        return " ".join(parts).strip()
+
+    name = re.sub(r"\s+", " ", str(value or "")).strip(" ,;")
+    if not name:
+        return ""
+
+    # HAL and some bibliographic APIs may return "Family, Given Middle".
+    if "," in name:
+        family_name, given_names = [part.strip() for part in name.split(",", 1)]
+        given_parts = given_names.split()
+        return " ".join(([given_parts[0]] if given_parts else []) + ([family_name] if family_name else []))
+
+    parts = name.split()
+    if len(parts) <= 2:
+        return name
+    # For a conventional "Given Middle Family" string, discard middle names.
+    return f"{parts[0]} {parts[-1]}"
+
+
 def authors_to_string(author_list):
     names = []
     if isinstance(author_list, dict):
         author_list = [author_list]
     for author in author_list or []:
         if isinstance(author, dict):
-            name = author.get("name") or " ".join(
-                x for x in [author.get("given"), author.get("family")] if x
+            name = first_and_last_name(
+                author.get("name"), given=author.get("given"), family=author.get("family")
             )
-            if name:
-                names.append(name.strip())
         elif author:
-            names.append(str(author))
+            name = first_and_last_name(author)
+        else:
+            name = ""
+        if name:
+            names.append(name)
     return "; ".join(dict.fromkeys(names))
 
 
@@ -1037,7 +1066,7 @@ def search_hal(query, search_field, year_from, year_to, max_results):
 
         title_values = values("title_s")
         title = title_values[0] if title_values else ""
-        authors = "; ".join(values("authFullName_s"))
+        authors = authors_to_string(values("authFullName_s"))
 
         # Explicit lab/institution fields first; generic structure fields are
         # used as a fallback because HAL records can have different schemas.
