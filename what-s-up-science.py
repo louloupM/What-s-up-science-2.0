@@ -949,92 +949,143 @@ def search_crossref(query, search_field, year_from, year_to, max_results):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_hal(query, search_field, year_from, year_to, max_results):
-    """Search HAL's public Solr API and normalize records for the dashboard."""
+    """Search HAL and extract document-level research structures and countries."""
     field_map = {
         "Tous les champs": "text",
         "Titre / résumé": "(title_t OR abstract_t)",
         "Auteur": "auth_t",
-        "Affiliation": "(labStructName_t OR instStructName_t)",
+        "Affiliation": "(labStructName_t OR instStructName_t OR structName_t)",
     }
+
     # HAL uses Solr syntax. Quoted phrase keeps multi-word searches together.
     safe_query = str(query).replace('\\', ' ').replace('"', ' ').strip()
     solr_query = f'{field_map[search_field]}:"{safe_query}"'
+    requested_fields = [
+        "docid", "halId_s", "uri_s", "title_s", "producedDateY_i",
+        "journalTitle_s", "authFullName_s", "authFullNameIdFormPerson_fs",
+        "labStructName_s", "labStructAcronym_s", "labStructCountry_s",
+        "instStructName_s", "instStructAcronym_s", "instStructCountry_s",
+        "structName_s", "structAcronym_s", "structCountry_s",
+        "affiliation_s", "country_s", "abstract_s", "keyword_s",
+        "doiId_s", "docType_s", "publisher_s", "language_s", "openAccess_bool",
+    ]
     params = {
         "q": solr_query,
         "wt": "json",
         "rows": min(int(max_results), 1000),
-        "fl": ",".join([
-            "docid", "halId_s", "uri_s", "title_s", "producedDateY_i", "journalTitle_s",
-            "authFullName_s", "labStructName_s", "labStructCountry_s",
-            "instStructName_s", "instStructCountry_s", "abstract_s",
-            "keyword_s", "doiId_s", "docType_s", "publisher_s",
-            "language_s", "openAccess_bool"
-        ]),
+        "fl": ",".join(requested_fields),
         "sort": "producedDateY_i desc",
     }
     if year_from and year_to:
         params["fq"] = f"producedDateY_i:[{int(year_from)} TO {int(year_to)}]"
 
     response = requests.get(
-        "https://api.archives-ouvertes.fr/search/",
+        "https://api.hal.science/search/",
         params=params, headers=API_HEADERS, timeout=60
     )
     response.raise_for_status()
-    payload = response.json()
-    records = payload.get("response", {}).get("docs", [])
+    records = response.json().get("response", {}).get("docs", [])
+
+    def as_values(value):
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
+    def unique_text(values):
+        result = []
+        for value in values:
+            if value is None:
+                continue
+            value = str(value).strip()
+            if value and value not in result:
+                result.append(value)
+        return result
+
+    def country_label(value):
+        """Convert HAL ISO country codes to readable country names."""
+        raw = str(value).strip()
+        if not raw:
+            return ""
+        try:
+            if len(raw) == 2:
+                country = pycountry.countries.get(alpha_2=raw.upper())
+                if country:
+                    return country.name
+            elif len(raw) == 3:
+                country = pycountry.countries.get(alpha_3=raw.upper())
+                if country:
+                    return country.name
+        except (LookupError, AttributeError):
+            pass
+        return raw
 
     rows = []
     for item in records:
-        def values(field):
-            value = item.get(field, [])
-            if value is None:
-                return []
-            return value if isinstance(value, list) else [value]
+        def values(*fields):
+            collected = []
+            for field in fields:
+                collected.extend(as_values(item.get(field)))
+            return unique_text(collected)
 
         title_values = values("title_s")
-        title = str(title_values[0]) if title_values else ""
-        authors = "; ".join(str(x) for x in values("authFullName_s") if x)
-        affiliation_values = (
-            values("labStructName_s") + values("instStructName_s")
+        title = title_values[0] if title_values else ""
+        authors = "; ".join(values("authFullName_s"))
+
+        # Explicit lab/institution fields first; generic structure fields are
+        # used as a fallback because HAL records can have different schemas.
+        lab_names = values("labStructName_s")
+        institution_names = values("instStructName_s")
+        generic_structures = values("structName_s", "affiliation_s")
+        structure_names = unique_text(lab_names + institution_names + generic_structures)
+        acronyms = values("labStructAcronym_s", "instStructAcronym_s", "structAcronym_s")
+        affiliations = list(structure_names)
+        for acronym in acronyms:
+            if acronym not in affiliations and not any(acronym in name for name in affiliations):
+                affiliations.append(acronym)
+
+        country_values = values(
+            "labStructCountry_s", "instStructCountry_s", "structCountry_s", "country_s"
         )
-        affiliations = "; ".join(dict.fromkeys(str(x) for x in affiliation_values if x))
-        countries = values("labStructCountry_s") + values("instStructCountry_s")
+        countries = unique_text(country_label(x) for x in country_values)
+        affiliation_text = "; ".join(affiliations)
         if countries:
-            affiliations += ("; " if affiliations else "") + "; ".join(str(x) for x in countries)
+            affiliation_text += ("; " if affiliation_text else "") + "; ".join(countries)
+
         journal_values = values("journalTitle_s")
         doi_values = values("doiId_s")
         docid = item.get("halId_s") or item.get("docid", "")
         uri_values = values("uri_s")
-        link = str(uri_values[0]) if uri_values else (f"https://hal.science/{docid}" if docid else "")
-        year_values = values("producedDateY_i")
-        abstract = " ".join(str(x) for x in values("abstract_s"))
-        keywords = "; ".join(str(x) for x in values("keyword_s") if x)
+        link = uri_values[0] if uri_values else (f"https://hal.science/{docid}" if docid else "")
+        year_values = as_values(item.get("producedDateY_i"))
+        abstract = " ".join(values("abstract_s"))
+        keywords = "; ".join(values("keyword_s"))
         type_values = values("docType_s")
         publisher_values = values("publisher_s")
         language_values = values("language_s")
-        open_access_values = values("openAccess_bool")
+        open_access_values = as_values(item.get("openAccess_bool"))
+
         rows.append({
             "Title": title,
             "Year": year_values[0] if year_values else None,
-            "Journal": str(journal_values[0]) if journal_values else "Unknown journal",
-            # HAL does not provide a consistent citation count in this search API.
+            "Journal": journal_values[0] if journal_values else "Unknown journal",
             "Cited by": 0,
-            "DOI": str(doi_values[0]) if doi_values else "",
+            "DOI": doi_values[0] if doi_values else "",
             "Authors": authors,
             "Author full names": authors,
             "Author(s) ID": "",
-            "Affiliations": affiliations,
+            "Affiliations": affiliation_text,
+            # Do not infer author-level links from document-level structures.
             "Authors with affiliations": "",
             "Abstract": clean_abstract(abstract),
             "Author Keywords": keywords,
             "Index Keywords": "",
-            "Publisher": str(publisher_values[0]) if publisher_values else "Unknown",
-            "Document Type": str(type_values[0]) if type_values else "Unknown",
+            "Publisher": publisher_values[0] if publisher_values else "Unknown",
+            "Document Type": type_values[0] if type_values else "Unknown",
             "Open Access": str(open_access_values[0]) if open_access_values else "",
             "EID": str(docid),
             "Link": link,
             "ISSN": "",
-            "Language": str(language_values[0]) if language_values else "",
+            "Language": language_values[0] if language_values else "",
             "Publication Stage": "",
         })
 
